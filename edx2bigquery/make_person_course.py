@@ -69,6 +69,7 @@ from path import Path as path
 import bqutil
 import gsutil
 from check_schema_tracking_log import check_schema, schema2dict
+from edx2bigquery_config import GEO_IP_DATASET_LOCATION
 from load_course_sql import find_course_sql_dir, get_course_sql_dirdate
 
 
@@ -1530,74 +1531,66 @@ class PersonCourse(object):
 
     def load_pc_geoip(self):
         '''
-        geoip information from modal_ip, using bigquery join with maxmind public geoip dataset
-        http://googlecloudplatform.blogspot.com/2014/03/geoip-geolocation-with-google-bigquery.html        
+        GeoIP information from modal_ip, using bigquery join with maxmind public geoip dataset.
+        https://cloud.google.com/blog/products/data-analytics/geolocation-with-bigquery-de-identify-76-million-ip-addresses-in-20-seconds
 
-        The public table is fh-bigquery:geocode.geolite_city_bq_b2b
-
-        If a private version is available use that instead.
+        The GeoIP table must be located in the same region of the Google Big Query project.
         '''
+        if not GEO_IP_DATASET_LOCATION:
+            self.log("Skipping pc_geoip location, GEO_IP_DATASET_LOCATION was not porvided.")
+            return
 
-        try:
-            private_geoip_tinfo = bqutil.get_bq_table_info('geocode', 'GeoIPCityCountry')
-            assert private_geoip_tinfo is not None
-        except Exception as err:
-            private_geoip_tinfo = None
-
-        use_private_geoip = False
-        geoip_table = "fh-bigquery:geocode.geolite_city_bq_b2b"
-        sql_extra_geoip = """
-                  "" as region_code,
-                  "" as subdivision,
-                  postalCode, 
-                  "" as continent,
-                  "" as un_region,
-                  "" as econ_group,
-                  "" as developing_nation,
-                  "" as special_region1,
-        """
-
-        if private_geoip_tinfo:
-            use_private_geoip = True
-            geoip_table = "geocode.GeoIPCityCountry"
-            sql_extra_geoip = """
-                  region_code,
-                  subdivision,
-                  postalCode, 
-                  continent,
-                  un_region,
-                  econ_group,
-                  developing_nation,
-                  special_region1,
-            """
-        self.log("    Using %s for geoip information" % geoip_table)
-
-        the_sql = '''
-            SELECT username, country, city, countryLabel, latitude, longitude,
-                   # region_code, subdivision, postalCode, continent, un_region, econ_group, developing_nation, special_region1
-                   {sql_extra_geoip}
+        query = """
+        SELECT
+        reduced_ip_user_list.username,
+        MAX(geo_locations.country_iso_code) AS country,
+        MAX(geo_locations.city_name) AS city,
+        MAX(geo_locations.country_name) AS countryLabel,
+        MAX(reduced_ip_user_list.latitude) AS latitude,
+        MAX(reduced_ip_user_list.longitude) AS longitude
+        FROM (
+            SELECT ip_subnet_mask_list.username, geo_ip.geoname_id, geo_ip.latitude, geo_ip.longitude
             FROM (
-             SELECT
-               username,
-               INTEGER(PARSE_IP(modal_ip)) AS clientIpNum,
-               INTEGER(PARSE_IP(modal_ip)/(256*256)) AS classB
-             FROM
-               [{dataset}.pc_modal_ip]
-             WHERE modal_ip IS NOT NULL
-               ) AS a
-            JOIN EACH [{geoip_table}] AS b
-            ON a.classB = b.classB
-            WHERE a.clientIpNum BETWEEN b.startIpNum AND b.endIpNum
-            AND city != ''
-            ORDER BY username
-        '''.format(geoip_table=geoip_table, sql_extra_geoip=sql_extra_geoip, **self.sql_parameters)
-        
+                SELECT
+                    username,
+                    NET.IP_TO_STRING(
+                    NET.SAFE_IP_FROM_STRING(modal_ip)
+                    & NET.IP_NET_MASK(4, mask)
+                    ) AS user_ip
+                FROM
+                    {dataset}.pc_modal_ip,
+                    UNNEST(GENERATE_ARRAY(16,32)) AS mask
+                WHERE
+                    modal_ip IS NOT NULL
+                ) AS ip_subnet_mask_list
+            JOIN `{geo_ip_dataset_location}.ipv4_city_blocks` AS geo_ip
+            ON REGEXP_EXTRACT(geo_ip.network, r"(.+)(?:/)+") = ip_subnet_mask_list.user_ip
+            GROUP BY ip_subnet_mask_list.username, geo_ip.geoname_id, geo_ip.latitude, geo_ip.longitude
+            ORDER BY ip_subnet_mask_list.username
+            ) AS reduced_ip_user_list
+        LEFT JOIN `{geo_ip_dataset_location}.ipv4_city_locations` AS geo_locations
+        USING (geoname_id)
+        GROUP BY reduced_ip_user_list.username
+        """.format(
+            geo_ip_dataset_location=GEO_IP_DATASET_LOCATION,
+            **self.sql_parameters
+        )
         tablename = 'pc_geoip'
 
         self.log("Loading %s from BigQuery" % tablename)
-        setattr(self, tablename, bqutil.get_bq_table(self.dataset, tablename, the_sql, key={'name': 'username'},
-                                                     depends_on=[ '%s.pc_modal_ip' % self.dataset ],
-                                                     force_query=self.force_recompute_from_logs, logger=self.log))
+        setattr(
+            self,
+            tablename,
+            bqutil.get_bq_table(
+                self.dataset,
+                tablename,
+                query,
+                key={'name': 'username'},
+                depends_on=[ '%s.pc_modal_ip' % self.dataset ],
+                force_query=self.force_recompute_from_logs,
+                logger=self.log,
+            ),
+        )
 
     def load_cwsm(self):
         self.cwsm = self.load_csv('studentmodule.csv', 'student_id', fields=['module_id', 'module_type'], keymap=int)
